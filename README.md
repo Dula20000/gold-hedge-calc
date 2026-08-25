@@ -53,6 +53,51 @@ both feeds allow cross-origin browser requests:
 futures entry, size. A public repo publishes them. Use a private repo (Pages on
 private repos needs GitHub Pro) or run it locally if that matters.
 
+## Why the futures leg is estimated
+
+The `/1OZV26` print is 10 minutes delayed on every free source, which is far
+wider than the edge on this trade -- a $12 move in gold while the print sits
+still is worth more than the entire cushion at -3%.
+
+Gold futures are just spot plus cost of carry, and carry drifts over days, not
+minutes. So the mark is `F = S + basis`, where basis is re-anchored once a
+minute by diffing the delayed print against spot **as it was when that print was
+made** (a 20-minute spot history is kept for exactly this). Live spot then
+re-marks the short every 6 seconds. Untick "Mark futures live from spot + basis"
+to fall back to the raw delayed print.
+
+At cold start there is no spot history yet, so the first basis is computed
+against current spot and labelled `(rough)`; it upgrades to anchored within
+~10 minutes of the page being open.
+
+## About the AllTick key
+
+AllTick **cannot** provide this futures contract, for three independent reasons:
+
+1. **It lists no futures instruments.** The commodity product list is spot/CFD
+   only -- `GOLD`, `Silver`, `Platinum`, `USOIL`... `GC` returns
+   `{"ret":600,"msg":"code invalid"}`, and the docs state that codes absent from
+   the product list are unsupported. There are no dated COMEX contracts.
+2. **It sends no CORS headers**, so the hosted static page cannot call it at all.
+3. Its documented basic-plan limit is 1 request/second, and in practice requests
+   3 seconds apart still returned `{"error_msg":"Too many requests"}`.
+
+What it *can* do is tick-level **spot**, which is genuinely useful here since
+spot is what re-marks the short. So it is wired into `server.py` only, as the
+preferred spot source with automatic gold-api fallback:
+
+```bash
+echo "YOUR-TOKEN" > gold-hedge-calc/.alltick-token   # gitignored, never committed
+python3 gold-hedge-calc/server.py
+```
+
+The page probes `/api/spot` once; on a static host that 404s and it uses
+gold-api directly forever after. **The token is never in this repo** -- it would
+be world-readable here, and it is read from `.alltick-token` or `$ALLTICK_TOKEN`
+at runtime instead. AllTick reports true last-trade age, which the spot tile
+shows, so a stale tick during the 17:00-18:00 ET CME break is visible rather
+than silently trusted.
+
 ## Live data
 
 | Feed | Source | Notes |

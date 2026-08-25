@@ -93,6 +93,8 @@
   .quick button.on{border-color:var(--gold);background:rgba(217,180,91,.1)}
   .foot{font-size:11.5px;color:var(--dim);margin-top:14px;text-align:center}
   .warn{color:var(--gold)}
+  .est{background:var(--gold);color:#1a1205;font-size:9px;font-weight:700;
+       padding:1px 4px;border-radius:3px;letter-spacing:.06em;margin-right:4px}
 </style>
 </head>
 <body>
@@ -164,6 +166,7 @@
       <div class="f"><label>Costco cashback (%)</label><input type="number" step="0.1" id="pCash" value="2"></div>
       <div class="f"><label>Spot at purchase (reference)</label><input type="number" step="0.01" id="pSpot0" value="4489.94"></div>
     </div>
+    <label class="chk"><input type="checkbox" id="pEst" checked> Mark futures live from spot + basis (off = use the 10-min delayed print)</label>
     <label class="chk"><input type="checkbox" id="pRT" checked> Commission is round-turn (2 sides)</label>
     <label class="chk"><input type="checkbox" id="pRew" checked> Count miles + cashback as profit</label>
     <div style="margin-top:14px;display:flex;gap:8px">
@@ -178,7 +181,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const FIELDS = ["pBuy","pEntry","pFut","pQty","pComm","pMiles","pCpp","pCash","pSpot0"];
-const CHECKS = ["pRT","pRew"];
+const CHECKS = ["pRT","pRew","pEst"];
 const KEY = "goldhedge.v2";
 let live = {spot:null, fut:null, cross:null, ok:false};
 
@@ -368,97 +371,156 @@ QUICK.forEach(b => b.onclick = () => {
 
 /* ---------- live quotes ----------
    Fetched straight from the browser so the page works as a plain static file
-   (GitHub Pages included). Both APIs send permissive CORS headers:
-     api.gold-api.com          Access-Control-Allow-Origin: *
-     scanner.tradingview.com   reflects the origin, GET only, no custom headers
-   Yahoo sends no CORS header at all, so it stays a server-side-only fallback
-   inside server.py, reached via /api/quotes when this page is served by it. */
+   (GitHub Pages included). Both feeds send permissive CORS headers:
+     api.gold-api.com          Access-Control-Allow-Origin: *   -- real time
+     scanner.tradingview.com   reflects the origin, GET only    -- 10 min delayed
+
+   The futures print is 10 minutes stale, which is far wider than the edge on
+   this trade, so the mark is estimated instead:  F = S + basis.  Basis is pure
+   cost of carry to Oct 2026 -- it drifts over days, not minutes -- so it is
+   re-anchored once a minute against the delayed print and applied to live spot.
+
+   AllTick can't serve this leg: it lists no futures instruments at all (GC ->
+   {"ret":600,"msg":"code invalid"}) and sends no CORS headers. See README. */
 
 const TV = "https://scanner.tradingview.com/symbol?symbol=";
-const lastGood = {spot:null, futures:null};
+const SPOT_MS = 6000, ANCHOR_MS = 60000, HIST_MS = 20*60*1000;
+const BKEY = "goldhedge.basis.v1";
+
+let basis = null;        // {value, at, method:"anchored"|"rough"}
+let spotHist = [];       // [{t, p}] -- lets us diff the delayed print against spot AT THAT TIME
+let tvPrint = null;      // last raw TradingView print
+let lastErr = [];
+
+try{ basis = JSON.parse(localStorage.getItem(BKEY) || "null"); }catch(e){}
 
 const jget = url => fetch(url, {cache:"no-store", credentials:"omit"})
   .then(r => r.ok ? r.json() : Promise.reject(new Error("HTTP "+r.status)));
 
-async function fetchDirect(){
-  const [spotR, futR, crossR] = await Promise.allSettled([
-    jget("https://api.gold-api.com/price/XAU"),
-    jget(TV + encodeURIComponent("COMEX:1OZV2026") + "&fields=close,change,update_mode"),
-    jget(TV + encodeURIComponent("COMEX:GCV2026") + "&fields=close"),
-  ]);
-  const errors = [];
-  const out = {spot:null, futures:null, errors, mode:"direct"};
+/* spot: every 6s. If server.py is serving this page it may have a tick-level
+   AllTick feed behind /api/spot; on a static host that 404s once and we stop asking. */
+let serverSpot = true;
 
-  if(spotR.status === "fulfilled" && spotR.value.price != null){
-    out.spot = {price:+spotR.value.price, source:"gold-api.com",
-                asOf:spotR.value.updatedAt || new Date().toISOString()};
-  } else errors.push("spot: " + (spotR.reason || "no price"));
-
-  if(futR.status === "fulfilled" && futR.value.close != null){
-    const mode = futR.value.update_mode || "";
-    const delay = mode.includes("600") ? 600 : mode.includes("900") ? 900 : 0;
-    out.futures = {
-      price:+futR.value.close, symbol:"1OZV26", source:"tradingview (COMEX)",
-      delaySec:delay, asOf:new Date(Date.now() - delay*1000).toISOString(),
-      cross: crossR.status === "fulfilled" && crossR.value.close != null ? +crossR.value.close : null,
-    };
-  } else errors.push("1OZV26: " + (futR.reason || "no price"));
-
-  // a failed refresh keeps the last good number, flagged stale, instead of blanking
-  ["spot","futures"].forEach(k => {
-    if(out[k]) lastGood[k] = out[k];
-    else if(lastGood[k]) out[k] = Object.assign({}, lastGood[k], {stale:true});
-  });
-  return out;
-}
-
-async function getQuotes(){
-  const direct = await fetchDirect();
-  if(direct.spot || direct.futures) return direct;
-  // Nothing came back -- if server.py is serving this page, let it proxy instead.
-  const d = await jget("api/quotes");
-  d.mode = "server";
-  return d;
-}
-
-async function fetchQuotes(){
-  try{
-    const d = await getQuotes();
-    live.spot  = d.spot ? d.spot.price : null;
-    live.fut   = d.futures ? d.futures.price : null;
-    live.cross = d.futures ? d.futures.cross : null;
-    live.ok = !!(d.spot && d.futures);
-
-    $("tSpot").textContent = live.spot ? "$"+px(live.spot) : "—";
-    $("tSpotSub").textContent = d.spot ? (d.spot.source + (d.spot.stale ? " · stale" : " · live")) : "unavailable";
-    $("tFut").textContent = live.fut ? px(live.fut) : "—";
-    $("dot").className = "live" + (live.ok ? (d.spot.stale ? " stale" : "") : " dead");
-
-    if(d.futures){
-      const delayMin = Math.round((d.futures.delaySec || 0)/60);
-      let sub = d.futures.source.split(" ")[0] + (delayMin ? " · "+delayMin+"m delayed" : " · last trade");
-      if(live.cross) sub += " · GCV26 "+px(live.cross);
-      $("tFutSub").innerHTML = d.futures.stale
-        ? '<span class="warn">'+sub+' · feed retrying</span>' : sub;
-    } else {
-      $("tFutSub").innerHTML = '<span class="warn">unavailable — enter it manually below</span>';
-    }
-    $("foot").textContent = "Updated " + new Date().toLocaleTimeString() + " · auto-refresh 30s"
-      + (d.errors && d.errors.length ? " · " + d.errors.join("; ") : "");
-  }catch(e){
-    $("dot").className = "live dead";
-    $("foot").textContent = "No quotes — both feeds unreachable. Enter the futures price manually below. (" + e.message + ")";
+async function fetchSpot(){
+  if(serverSpot){
+    try{
+      const d = await jget("api/spot");
+      if(d.price == null) throw new Error("no price");
+      live.spot = +d.price; live.spotSource = d.source; live.spotStale = false;
+      live.tickAge = d.tickAgeSec;   // AllTick reports true last-trade age; surface it
+      const now = Date.now();
+      spotHist.push({t:now, p:live.spot});
+      spotHist = spotHist.filter(x => now - x.t <= HIST_MS);
+      lastErr = lastErr.filter(e => !e.startsWith("spot"));
+      return;
+    }catch(e){ serverSpot = false; }
   }
-  render();
+  try{
+    const d = await jget("https://api.gold-api.com/price/XAU");
+    if(d.price == null) throw new Error("no price");
+    live.spot = +d.price;
+    live.spotSource = "gold-api.com";
+    live.spotStale = false;
+    live.tickAge = null;
+    const now = Date.now();
+    spotHist.push({t:now, p:live.spot});
+    spotHist = spotHist.filter(x => now - x.t <= HIST_MS);
+    lastErr = lastErr.filter(e => !e.startsWith("spot"));
+  }catch(e){
+    live.spotStale = true;
+    if(!lastErr.some(x => x.startsWith("spot"))) lastErr.push("spot: " + e.message);
+  }
 }
+
+/* futures print + basis re-anchor: every 60s */
+async function fetchAnchor(){
+  try{
+    const [f, c] = await Promise.allSettled([
+      jget(TV + encodeURIComponent("COMEX:1OZV2026") + "&fields=close,update_mode"),
+      jget(TV + encodeURIComponent("COMEX:GCV2026") + "&fields=close"),
+    ]);
+    if(f.status !== "fulfilled" || f.value.close == null) throw new Error(f.reason || "no close");
+
+    const mode = f.value.update_mode || "";
+    const delaySec = mode.includes("600") ? 600 : mode.includes("900") ? 900 : 0;
+    tvPrint = {price:+f.value.close, delaySec, at:Date.now()};
+    live.cross = c.status === "fulfilled" && c.value.close != null ? +c.value.close : null;
+
+    // Diff the print against spot as it was when that print was made.
+    const anchorT = Date.now() - delaySec*1000;
+    let best = null, bestGap = Infinity;
+    spotHist.forEach(x => { const g = Math.abs(x.t - anchorT); if(g < bestGap){ bestGap = g; best = x; } });
+
+    if(best && bestGap < 150000){
+      basis = {value: tvPrint.price - best.p, at: Date.now(), method:"anchored"};
+      localStorage.setItem(BKEY, JSON.stringify(basis));
+    } else if(!basis && live.spot !== null){
+      // Cold start: no spot history that far back yet. Rough, but better than a stale print.
+      basis = {value: tvPrint.price - live.spot, at: Date.now(), method:"rough"};
+      localStorage.setItem(BKEY, JSON.stringify(basis));
+    }
+    lastErr = lastErr.filter(e => !e.startsWith("1OZV26"));
+  }catch(e){
+    if(!lastErr.some(x => x.startsWith("1OZV26"))) lastErr.push("1OZV26: " + (e.message || e));
+  }
+}
+
+/** What we mark the short against: live estimate if we can, raw print otherwise. */
+function futuresMark(){
+  const useEst = $("pEst").checked;
+  if(useEst && basis && live.spot !== null) return {price: round2(live.spot + basis.value), est:true};
+  if(tvPrint) return {price: tvPrint.price, est:false};
+  return null;
+}
+
+function paintQuotes(){
+  $("tSpot").textContent = live.spot ? "$"+px(live.spot) : "—";
+  if(!live.spot){ $("tSpotSub").textContent = "unavailable"; }
+  else {
+    const src = live.spotSource || "gold-api.com";
+    const old = live.tickAge != null && live.tickAge > 120;
+    const tag = live.spotStale ? "stale"
+      : live.tickAge != null
+        ? "last trade " + (live.tickAge < 90 ? live.tickAge+"s" : Math.round(live.tickAge/60)+"m") + " ago"
+        : "live 6s";
+    $("tSpotSub").innerHTML = old ? '<span class="warn">'+src+" · "+tag+" (market closed?)</span>" : src+" · "+tag;
+  }
+
+  const mark = futuresMark();
+  live.fut = mark ? mark.price : null;
+  $("tFut").textContent = mark ? px(mark.price) : "—";
+  $("dot").className = "live" + (live.spot && mark ? (live.spotStale ? " stale" : "") : " dead");
+
+  if(!mark){
+    $("tFutSub").innerHTML = '<span class="warn">unavailable — enter it manually below</span>';
+  } else if(mark.est){
+    const age = Math.round((Date.now() - tvPrint.at)/1000);
+    $("tFutSub").innerHTML = '<span class="est">EST</span> spot ' +
+      (basis.value>=0?"+":"−") + px(Math.abs(basis.value)) + " basis" +
+      (basis.method === "rough" ? ' <span class="warn">(rough)</span>' : "") +
+      " · print " + px(tvPrint.price) + " " + (age<90 ? age+"s" : Math.round(age/60)+"m") + " ago";
+  } else {
+    const delayMin = Math.round((tvPrint.delaySec||0)/60);
+    $("tFutSub").innerHTML = "tradingview · " + (delayMin ? delayMin+"m delayed" : "last trade")
+      + (live.cross ? " · GCV26 "+px(live.cross) : "");
+  }
+
+  $("foot").textContent = "Spot " + new Date().toLocaleTimeString() + " · spot 6s / futures 60s"
+    + (lastErr.length ? " · " + lastErr.join("; ") : "");
+}
+
+async function fetchQuotes(){ await fetchSpot(); paintQuotes(); render(); }
+// spot first: the basis anchor needs a spot price to fall back on at cold start
+async function fetchAll(){ await fetchSpot(); await fetchAnchor(); paintQuotes(); render(); }
 
 /* ---------- wiring ---------- */
 load();
 FIELDS.forEach(f => $(f).addEventListener("input", render));
 CHECKS.forEach(c => $(c).addEventListener("change", render));
+$("pEst").addEventListener("change", () => { paintQuotes(); render(); });
 $("bid").addEventListener("input", onBidInput);
 $("bid").addEventListener("blur", render);       // settles "-3%" into the resolved price
-$("refresh").onclick = fetchQuotes;
+$("refresh").onclick = fetchAll;
 $("reset").onclick = () => { localStorage.removeItem(KEY); location.reload(); };
 
 // quick re-quoting: clicking the field always replaces the old number, Esc clears
@@ -470,8 +532,9 @@ $("bid").addEventListener("keydown", e => {
 });
 
 render();
-fetchQuotes();
-setInterval(fetchQuotes, 30000);
+fetchAll();
+setInterval(fetchQuotes, SPOT_MS);     // spot re-marks the short every 6s
+setInterval(fetchAnchor, ANCHOR_MS);   // re-anchor the basis once a minute
 </script>
 </body>
 </html>

@@ -15,6 +15,7 @@ import http.cookiejar
 import json
 import os
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -59,10 +60,48 @@ def yahoo_quote(symbol):
     raise last_err
 
 
-def spot_price():
+def _alltick_token():
+    """Token from env or an untracked local file -- never hard-coded, never committed."""
+    tok = os.environ.get("ALLTICK_TOKEN", "").strip()
+    if tok:
+        return tok
+    path = os.path.join(HERE, ".alltick-token")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read().strip()
+    return ""
+
+
+def alltick_spot(token):
+    """Tick-level spot gold. AllTick has no futures instruments and sends no
+    CORS headers, so it is reachable only through this proxy, for spot only."""
+    query = json.dumps({"trace": "gh-%d" % time.time(),
+                        "data": {"symbol_list": [{"code": "GOLD"}]}})
+    url = ("https://quote.alltick.io/quote-b-api/trade-tick"
+           f"?token={urllib.parse.quote(token)}&query={urllib.parse.quote(query)}")
+    d = _get_json(url)
+    if "error_msg" in d:
+        raise RuntimeError(d["error_msg"])            # e.g. "Too many requests"
+    tick = d["data"]["tick_list"][0]
+    age = time.time() - int(tick["tick_time"]) / 1000
+    return {"price": float(tick["price"]), "source": "alltick GOLD",
+            "asOf": _iso(int(tick["tick_time"]) / 1000), "tickAgeSec": int(age)}
+
+
+def goldapi_spot():
     d = _get_json("https://api.gold-api.com/price/XAU")
     return {"price": float(d["price"]), "source": "gold-api.com",
             "asOf": d.get("updatedAt") or _iso(time.time())}
+
+
+def spot_price():
+    token = _alltick_token()
+    if token:
+        try:
+            return alltick_spot(token)
+        except Exception:
+            pass                                       # rate-limited or down -> gold-api
+    return goldapi_spot()
 
 
 def tv_futures():
@@ -158,6 +197,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/api/spot":
+            errors = []
+            self._send(200, json.dumps(cached("spot", 5, spot_price, errors) or {"error": errors}),
+                       "application/json")
+            return
         if path == "/api/quotes":
             self._send(200, json.dumps(collect()), "application/json")
             return
