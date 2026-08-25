@@ -320,7 +320,7 @@ function render(){
               "$"+px(num($("pComm").value)??0)+($("pRT").checked?" × 2 sides":" × 1 side")+" × "+r.qty,
               money(-r.comm), "neg");
   if(r.rewardsOn){
-    html += row("Credit-card miles",
+    html += row("CapOne 2x @ 1cpp miles",
                 Math.round(milesPts).toLocaleString()+" pts @ "+(num($("pCpp").value)??0)+"¢",
                 money(r.miles), "pos");
     html += row("Costco cashback",
