@@ -1,220 +1,155 @@
 #!/usr/bin/env python3
-"""Local quote server for the gold hedge calculator.
+"""Optional local server for the hedge calculators.
 
-Fetches server-side; browsers can't hit these directly (no CORS headers):
-  spot     : api.gold-api.com          -> XAU/USD spot
-  futures  : TradingView COMEX:1OZV2026 -> Oct 2026 1-Ounce Gold, 10-min delayed
-             (falls back to Yahoo 1OZV26.CMX, which 429s under heavy polling)
-             also returns COMEX:GCV2026 as a sanity cross-check
-
-Everything is cached, and a failed refresh serves the last good price marked
-stale rather than dropping the value.
+It keeps COLLECTPURE_API_KEY on the server and serves the static pages.  GitHub
+Pages can use the public spot fallback, but cannot safely make authenticated
+CollectPure requests.
 """
-
-import http.cookiejar
 import json
+import mimetypes
 import os
 import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(os.environ.get("PORT", 8787))
 HERE = os.path.dirname(os.path.abspath(__file__))
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-FUT_TTL = 25       # seconds between live 1OZV26 fetches
-SPOT_TTL = 20
-
-_opener = urllib.request.build_opener(
-    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-_last = {}   # key -> {"value": dict, "at": epoch}
+PORT = int(os.environ.get("PORT", "8787"))
+METAL_CODES = {"gold": "XAU", "silver": "XAG", "platinum": "XPT",
+               "palladium": "XPD", "copper": "XCU"}
+_cache = {}
 
 
-def _get_json(url, timeout=8):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with _opener.open(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def _iso(epoch):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
-
-
-def yahoo_quote(symbol):
-    """(price, epoch) for a Yahoo symbol; tries both query hosts on failure."""
-    last_err = None
-    for host in ("query1", "query2"):
-        try:
-            url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/"
-                   f"{symbol}?interval=1m&range=1d")
-            meta = _get_json(url)["chart"]["result"][0]["meta"]
-            price = meta.get("regularMarketPrice")
-            if price is None:
-                raise ValueError("no regularMarketPrice")
-            return float(price), int(meta.get("regularMarketTime") or time.time())
-        except Exception as e:
-            last_err = e
-            time.sleep(0.4)
-    raise last_err
-
-
-def _alltick_token():
-    """Token from env or an untracked local file -- never hard-coded, never committed."""
-    tok = os.environ.get("ALLTICK_TOKEN", "").strip()
-    if tok:
-        return tok
-    path = os.path.join(HERE, ".alltick-token")
-    if os.path.exists(path):
-        with open(path) as f:
-            return f.read().strip()
+def key():
+    """Read the key only at runtime; never put it in the repository."""
+    value = os.environ.get("COLLECTPURE_API_KEY", "").strip()
+    if value:
+        return value
+    filename = os.path.join(HERE, ".collectpure-key")
+    if os.path.isfile(filename):
+        with open(filename, encoding="utf-8") as file:
+            return file.read().strip()
     return ""
 
 
-def alltick_spot(token):
-    """Tick-level spot gold. AllTick has no futures instruments and sends no
-    CORS headers, so it is reachable only through this proxy, for spot only."""
-    query = json.dumps({"trace": "gh-%d" % time.time(),
-                        "data": {"symbol_list": [{"code": "GOLD"}]}})
-    url = ("https://quote.alltick.io/quote-b-api/trade-tick"
-           f"?token={urllib.parse.quote(token)}&query={urllib.parse.quote(query)}")
-    d = _get_json(url)
-    if "error_msg" in d:
-        raise RuntimeError(d["error_msg"])            # e.g. "Too many requests"
-    tick = d["data"]["tick_list"][0]
-    age = time.time() - int(tick["tick_time"]) / 1000
-    return {"price": float(tick["price"]), "source": "alltick GOLD",
-            "asOf": _iso(int(tick["tick_time"]) / 1000), "tickAgeSec": int(age)}
+def get_json(url, headers=None):
+    request = urllib.request.Request(url, headers=headers or {"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
-def goldapi_spot():
-    d = _get_json("https://api.gold-api.com/price/XAU")
-    return {"price": float(d["price"]), "source": "gold-api.com",
-            "asOf": d.get("updatedAt") or _iso(time.time())}
+def cached(name, seconds, load):
+    saved = _cache.get(name)
+    if saved and time.time() - saved[0] < seconds:
+        return saved[1]
+    value = load()
+    _cache[name] = (time.time(), value)
+    return value
 
 
-def spot_price():
-    token = _alltick_token()
-    if token:
+def public_spot(metal):
+    code = METAL_CODES.get(metal.lower())
+    if not code:
+        raise ValueError("Unsupported metal")
+    data = get_json("https://api.gold-api.com/price/" + code)
+    return {"price": float(data["price"]), "source": "gold-api.com"}
+
+
+def collectpure_spot(metal):
+    token = key()
+    if not token:
+        raise RuntimeError("CollectPure is not configured")
+    data = get_json("https://api.collectpure.com/marketplace/get-spot-price/v1",
+                    {"Accept": "application/json", "x-api-key": token})
+    for quote in data.get("data", []):
+        if str(quote.get("material", "")).lower() == metal.lower():
+            return {"price": float(quote["bid"]), "source": "CollectPure spot bid"}
+    raise ValueError("No CollectPure spot price for " + metal)
+
+
+def spot(metal):
+    cache_key = "spot:" + metal.lower()
+    def load():
         try:
-            return alltick_spot(token)
+            return collectpure_spot(metal)
         except Exception:
-            pass                                       # rate-limited or down -> gold-api
-    return goldapi_spot()
+            return public_spot(metal)
+    return cached(cache_key, 10, load)
 
 
-def tv_futures():
-    """Primary: TradingView returns 1OZV26 and GCV26 in one call, 10-min delayed."""
-    body = json.dumps({
-        "symbols": {"tickers": ["COMEX:1OZV2026", "COMEX:GCV2026"]},
-        "columns": ["close", "change", "update_mode"],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://scanner.tradingview.com/futures/scan", data=body,
-        headers={"User-Agent": UA, "Content-Type": "application/json"})
-    with _opener.open(req, timeout=8) as r:
-        rows = json.loads(r.read().decode("utf-8"))["data"]
-
-    by_sym = {row["s"]: row["d"] for row in rows}
-    one = by_sym.get("COMEX:1OZV2026")
-    if not one or one[0] is None:
-        raise ValueError("no 1OZV2026 price")
-
-    mode = one[2] or ""
-    delay = 600 if "600" in mode else (900 if "900" in mode else 0)
-    cross = by_sym.get("COMEX:GCV2026")
-    return {
-        "price": float(one[0]),
-        "changePct": one[1],
-        "symbol": "1OZV26",
-        "source": "tradingview (COMEX)",
-        "delaySec": delay,
-        "asOf": _iso(time.time() - delay),
-        "cross": float(cross[0]) if cross and cross[0] is not None else None,
-    }
-
-
-def yahoo_futures():
-    """Fallback if TradingView fails. Yahoo 429s under heavy polling."""
-    px, ts = yahoo_quote("1OZV26.CMX")
-    out = {"price": px, "symbol": "1OZV26", "source": "yahoo (fallback)",
-           "delaySec": 0, "asOf": _iso(ts), "cross": None}
-    try:
-        out["cross"] = yahoo_quote("GCV26.CMX")[0]
-    except Exception:
-        pass
-    return out
-
-
-def futures_quote():
-    try:
-        return tv_futures()
-    except Exception as tv_err:
+def highest_bid(metal):
+    token = key()
+    if not token:
+        raise RuntimeError("COLLECTPURE_API_KEY is not configured")
+    # A marketplace offer is product-specific.  The UI displays the product so
+    # a user can confirm its denomination before treating the number as $/oz.
+    params = urllib.parse.urlencode({
+        "query": "*", "limit": 250,
+        "filter_by": "material:=" + metal + " && has_offer:=true",
+    })
+    data = get_json("https://api.collectpure.com/products/search/v1?" + params,
+                    {"Accept": "application/json", "x-api-key": token})
+    products = data.get("data", {}).get("products", [])
+    choices = []
+    for product in products:
+        offer = product.get("offer") or product.get("highestOffer") or {}
         try:
-            return yahoo_futures()
-        except Exception as y_err:
-            raise RuntimeError(f"tradingview: {tv_err}; yahoo: {y_err}")
-
-
-def cached(key, ttl, fetch, errors):
-    """Fetch through cache. On failure, serve the last good value as stale."""
-    now = time.time()
-    prev = _last.get(key)
-    if prev and now - prev["at"] < ttl:
-        return dict(prev["value"], stale=False, ageSec=int(now - prev["at"]))
-    try:
-        value = fetch()
-        _last[key] = {"value": value, "at": now}
-        return dict(value, stale=False, ageSec=0)
-    except Exception as e:
-        errors.append(f"{key}: {e}")
-        if prev:
-            return dict(prev["value"], stale=True, ageSec=int(now - prev["at"]))
-        return None
-
-
-def collect():
-    errors = []
-    out = {
-        "spot": cached("spot", SPOT_TTL, spot_price, errors),
-        "futures": cached("futures", FUT_TTL, futures_quote, errors),
-        "fetchedAt": _iso(time.time()),
-    }
-    out["errors"] = errors
-    return out
+            choices.append((float(offer["price"]), product.get("title", "CollectPure product")))
+        except (KeyError, TypeError, ValueError):
+            pass
+    if not choices:
+        raise ValueError("No active CollectPure bid for " + metal)
+    price, product = max(choices, key=lambda item: item[0])
+    return {"price": price, "product": product, "source": "CollectPure"}
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype):
-        data = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+    def send_json(self, status, value):
+        body = json.dumps(value).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def do_GET(self):
-        path = self.path.split("?")[0]
-        if path == "/api/spot":
-            errors = []
-            self._send(200, json.dumps(cached("spot", 5, spot_price, errors) or {"error": errors}),
-                       "application/json")
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/spot":
+            metal = query.get("metal", ["Gold"])[0]
+            try:
+                self.send_json(200, spot(metal))
+            except Exception as error:
+                self.send_json(502, {"error": str(error)})
             return
-        if path == "/api/quotes":
-            self._send(200, json.dumps(collect()), "application/json")
+        if parsed.path == "/api/collectpure/highest-bid":
+            metal = query.get("metal", ["Gold"])[0]
+            try:
+                self.send_json(200, cached("bid:" + metal.lower(), 15, lambda: highest_bid(metal)))
+            except Exception as error:
+                self.send_json(502, {"error": str(error)})
             return
-        if path in ("/", "/index.html"):
-            with open(os.path.join(HERE, "index.html"), "rb") as f:
-                self._send(200, f.read(), "text/html; charset=utf-8")
+        name = parsed.path.lstrip("/") or "index.html"
+        if "/" in name or name.startswith("."):
+            self.send_error(404)
             return
-        self._send(404, "not found", "text/plain")
+        filename = os.path.join(HERE, name)
+        if not os.path.isfile(filename):
+            self.send_error(404)
+            return
+        with open(filename, "rb") as file:
+            body = file.read()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        return  # quiet: the page polls every 30s
+    def log_message(self, *_):
+        pass
 
 
 if __name__ == "__main__":
-    print(f"gold hedge calculator -> http://localhost:{PORT}")
+    print("Hedge calculator -> http://localhost:%d" % PORT)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
